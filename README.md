@@ -6,7 +6,7 @@ Projects created for the 2020 Data Science Advanced Program taught at [Insper](h
 
 - *Demographic of Oscars* - Exploratory analysis of Kaggle dataset using basic Python.
 
-- *Twitter*: Use of Twitter API to gather tweets of key accounts to correlate them with the IBOV Index performance. (in Portuguese)
+- *Twitter*: Use of Twitter API to gather tweets of key accounts and correlate them with the IBOV Index performance. (in Portuguese)
 
 - *Web Scraping CFTC*: Gathering and brief analysis of the data used to generate the Commitment of Traders Report (COT) for all published commodities (in Portuguese)
 
