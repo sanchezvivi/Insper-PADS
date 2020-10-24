@@ -1,0 +1,530 @@
+---
+title: "Feature Engineering"
+subtitle: 'Práticas Avançadas de Visualização de Dados - PADS'
+author: "Viviane Sanchez"
+date: "24/07/2020 - 08/08/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, 
+                      fig.retina = 2 ,fig.height=5, fig.width=10)
+
+#rmarkdown::render("Feature_Engineering_DV.Rmd", envir=.GlobalEnv)
+
+```
+
+# 1. Introdução
+
+## Objetivo
+
+Tratar a base para ficar no formato tidy e agrupar lojas utilizando alguma técnica aprendida anteriormente, considerando a criação de novas features.
+
+# 2. Dados
+
+## Pacotes
+
+```{r eval = TRUE, tidy = FALSE}
+
+library(tidyverse)
+library(tidymodels)
+library(tidytext)
+library(skimr)
+library(inspectdf)
+library(lubridate)
+library(RcppRoll)
+library(parallelDist)
+library(factoextra)
+library(cluster)
+library(treemapify)
+library(ggthemes)
+
+```
+
+## Leitura do arquivo
+ 
+ A função `read_csv` lê o arquivo mais rápido e retorna um tibble. No entanto, na primeira tentativa, a coluna `codigo_grupo` retornou apenas NAs, pois a funçãa tenta adivinhar o tipo da coluna baseada nas 1000 primeiras linhas. 
+
+```{r}
+
+dados_raw <- read_csv('data/atividade.csv')
+
+dados_raw %>% 
+  inspect_na %>% 
+  show_plot(col_palette = 1) +
+  scale_fill_tableau("Tableau 20") +
+  theme_economist() +
+  theme(axis.text.x = element_text(size = 8, angle = 30,
+                                   vjust =  1, hjust = 1))
+  
+
+```
+
+
+Para contornar esse problema existem duas possibilidades. A primeira seria aumentar o número de linhas utilizadas para inferir o tipo da coluna com a opção `guess_max`. Essa opção, apesar de mais simples, possui um custo computacional maior, principalmente em arquivos grandes. A segunda opção, que será utilizada, é ler todo o arquivo como *string* e depois converter as coluas para os tipos corretos com `type_convert`. 
+
+```{r pressure, echo=FALSE}
+
+dados_raw <- read_csv('data/atividade.csv', 
+                        col_types = cols(.default = col_character())) %>% 
+             type_convert()
+
+skim(dados_raw)
+
+```
+
+Com isso, verifica-se que agora 41% dos dados dessa coluna são preenchidos.
+
+```{r}
+
+dados_raw %>% 
+  inspect_na %>% 
+  show_plot() + 
+  scale_fill_tableau("Tableau 20") +
+  theme_economist() +
+  theme(axis.text.x = element_text(size = 8, angle = 30,
+                                   vjust =  1, hjust = 1))
+  
+
+```
+
+
+# Formato Tidy
+
+O formato tidy, segundo Hadley Wickham em [4] é composto por uma tabela em que cada variável é uma coluna, cada observação é uma linha e cada valor possui sua própria célula. No caso desta base, **cada observação é uma venda de café**.
+
+Em primeiro lugar, os NAs da coluna `codigo_grupo` serão substituídos por 0 para as lojas que não são de nenhum grupo.
+
+```{r}
+
+#dados_raw %>% 
+  #glimpse
+
+dados <- dados_raw %>% 
+  mutate(codigo_grupo = if_else(is.na(codigo_grupo), 0, codigo_grupo)) %>% 
+  glimpse
+
+```
+
+## Descrição
+
+As observações da coluna `descricao` não possuem um padrão exato como é observado a seguir. Apesar de serem as mesmas informações, nem sempre a ordem é a mesma.
+
+```{r}
+
+dados %>% 
+  group_by(descricao) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+dados %>% 
+  group_by(descricao) %>% 
+  count() %>% 
+  arrange(n)
+
+dados %>% 
+  group_by(str_detect(descricao, 'CAFE')) %>% 
+  count()
+
+dados %>% 
+  group_by(str_detect(descricao, 'CAFE EM')) %>% 
+  count()
+
+```
+
+Nota-se, no etanto, que todas as linhas possuem 'CAFE'. Em alguns casos possui a especificação, em outros não. Após isso, são mencionados marca, intensidade, tipo de embalagem, quantidade e unidade, respectivamente.
+
+Inicia-se a análise pela unidade, extraindo com regex as letras após uma sequência numérica no final da descrição.
+
+```{r}
+
+dados %>% 
+  mutate(unidade = str_extract(descricao, '(?<=[0-9])[a-zA-Z]+$')) %>% 
+  group_by(unidade) %>% 
+  count()
+  
+dados %>% 
+  mutate(unidade = str_extract(descricao, '(?<=[0-9])[a-zA-Z]+$')) %>%
+  filter(is.na(unidade)) %>% 
+  group_by(descricao) %>% 
+  count() %>% 
+  arrange(n)
+```
+
+Observa-se que nos casos em que não é declarada, a unidade é gramas. Além disso, como já existe uma coluna para a quantiadde, essa informação também não precisará ser extraída. A descrição que mais se repete nesse caso parece ser uma promoção. Isso será levado em conta posteriormente.
+
+Dessa forma, será criada uma nova coluna mantendo apenas o que não contém os itens:
+- CAFE
+- EM PO
+- Número seguido de letras
+- Número com 3 dígitos
+- Pontuação
+
+Para não perder a informação 'EM PO', será criada a coluna `em_po` dummy para quando essa informação aparece na descrição.
+
+```{r}
+
+dados %>% 
+ group_by(fabricante) %>% 
+ count() %>% 
+ arrange(desc(n))
+
+dados2 <- dados %>% 
+  mutate(marca_int_emb = str_replace_all(descricao, 
+                                        'CAFE |EM PO |PO |[0-9]+[A-Z]+|[0-9]{3}|[[:punct:]]',''),
+         em_po = if_else(str_detect(descricao, 'EM PO|PO'), 1,0)) %>% 
+  glimpse
+
+```
+
+## Marcas
+
+Observando os dados, parece que apenas as marcas Pilão, Melitta, Pelé e 3 Corações estão presentes na base. Sabe-se também que existem apenas 3 fabricantes.
+
+```{r}
+
+dados2 %>% 
+  group_by(fabricante, marca_int_emb) %>% 
+  count() %>% 
+  arrange(n) #%>% view()
+
+dados2 %>% 
+  group_by(marca_int_emb) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+```
+
+Com isso, a coluna de fabricante será consultada para realizar a extração.
+Em seguida, a informação da marca será removida da coluna `marca_int_emb`, restando apenas as informações de intensidade e tipo de embalagem.
+
+```{r}
+
+dados3 <- dados2 %>% 
+  mutate(marca = case_when(fabricante == '3 CORACOES' ~ '3 CORACOES',
+                           str_detect(fabricante, 'MELIT') ~ 'MELITTA',
+                           str_detect(descricao, 'PELE') ~ 'PELE',
+                           str_detect(descricao, 'PILAO') ~ 'PILAO',
+                           str_detect(descricao, 'MOKA') ~ 'MOKA',
+                           TRUE ~ 'n/a'), 
+         int_emb = str_trim(str_replace_all(marca_int_emb, marca,''))) %>%
+  select(-X1, -marca_int_emb) %>% 
+  glimpse
+  
+
+
+```
+
+Em alguns casos, ainda restam algumas palavras, como por exemplo 'DO BRASIL', que serão desconsideradas. Para extrair o tipo de embalagem e intensidade, será analisado o que restou nessa coluna.
+
+```{r}
+
+dados3 %>% 
+  group_by(int_emb) %>% 
+  count() %>% 
+  arrange(desc(n)) #%>% view()
+
+```
+
+Baseado em buscas, nota-se que as embalagens 'STAND UP' e 'POUCH' são a mesma coisa. Além disso, 'VP' é uma abreviação para 'vácuo'
+
+Analisando os sites das marcas, percebe-se que 'Tradicional e 'Forte' são o mesmo tipo de café.
+
+Para finalizar, as variáveis `CEP`, `codigo_grupo` e `codigo_barras` serão transformadas em categóricas.
+
+```{r}
+
+tidy_data <- dados3 %>% 
+  mutate(embalagem = case_when(str_detect(int_emb, 'VAC|VP') ~ 'vácuo',
+                           str_detect(int_emb, 'ALM') ~ 'almofada',
+                           str_detect(int_emb, 'STAND|POUCH') ~ 'pouch',
+                           TRUE ~ 'outra'),
+         intensidade = case_when(str_detect(int_emb, 'DESC') ~ 'descafeínado',
+                           str_detect(int_emb, 'EXT') ~ 'extrafrote',
+                           str_detect(int_emb, 'FORT|TRAD') ~ 'tradicional',
+                           str_detect(int_emb, 'GOURMET|PREM|ORG|GRANISSIMO') ~ 'gourmet',
+                           TRUE ~ 'n/a'),
+         marca = case_when(marca == '3 CORACOES' ~ '3 corações',
+                           marca == 'MELITTA' ~ 'melitta',
+                           marca == 'PELE' ~ 'pelé',
+                           marca == 'PILAO' ~ 'pilão',
+                           marca == 'MOKA' ~ 'moka',
+                           TRUE ~ 'n/a'),
+         across(c(CEP, codigo_barras, 
+                  codigo_grupo, loja), as.character)) %>% 
+  select(-int_emb, -descricao) %>% 
+  glimpse
+
+```
+
+Após as transformações realizadas, pode-se dizer que a base está no formato tidy.
+
+# Feature Engineering
+
+## Data
+
+Além da coluna `em_po` criada anteriormente, serão criadas mais algumas outras. Inicialmente, serão extraídas as informações de dia do mês (`dia`), dia da semana (`dow`), mês (`mes`) e ano (`ano`).
+
+```{r}
+
+ft1 <- tidy_data %>% 
+  mutate(dow = wday(data) , #label = T, abbr = T),
+         dia = day(data),
+         mes = month(data) , #label = T, abbr = T),
+         ano = year(data)) %>% 
+  glimpse
+
+```
+
+Uma possibilidade de explorar esses dados seria pela sazonalidade ou calcular a autocorrelação das variáveis de forma a reduzir a dimensão. Neste relatório, no entanto, a redução será feita agregando os dados mensalmente.
+
+## Dados Quantitativos
+
+Em seguida, serão calculados a receita e quantidade total de café de cada venda. Para facilitar a análise, os dados serão agregados mensalmente por loja, marca, embalagem e intensidade. As categorias que identificam o local e grupo da loja, serão removidas, pois uma outra forma de agrupá-las está sendo buscada. Por fim, compara-se as médias móveis da receita total da loja de um período curto (2 meses) e de um longo (4 meses) para capturar mudanças nas tendências.
+
+```{r}
+
+ft2 <- ft1 %>% 
+  arrange(ano, mes, dia) %>%
+  mutate(receita = preco*qtd,
+         qtd_cafe = qtd*gramas) %>% 
+   group_by(ano, mes, loja, marca, embalagem, intensidade) %>% 
+   summarise(across(c(qtd, receita, qtd_cafe, em_po), sum),
+             across(c(caixas, importe_total, ticket_total), mean),
+             px_avg = sum(receita, na.rm = T)/sum(qtd_cafe, na.rm = T)) %>% 
+   group_by(ano, mes, loja) %>% 
+      mutate(ma_short = roll_mean(receita, 2, fill = 0, na.rm = T),
+             ma_long = roll_mean(receita, 4, fill = 0, na.rm = T),
+             diff_ma = ma_long - ma_short) %>% 
+  ungroup() %>% 
+  mutate(ano_mes = paste(ano, mes, sep = '-')) %>% 
+  na.omit() %>% 
+  glimpse
+
+```
+
+
+## Dados Qualitativos
+
+Nessa etapa de feature engineering, será utilizado o pacote `recipes`, que permite a transformação de variáveis com *steps*.
+
+As seguintes transformações podem ser realizadas:
+
+- `step_other`: Redução a quantidade de categorias conforme o limite (threshold) informado. 
+- `step_dummy`: Transforma variáveis categóricas em dummy.
+- `step_interact`: Cria interações entre as variáveis indicadas. Idealmente, é feito um estudo mais profundo das variáveis para entender quais fariam sentido interagir.
+
+```{r}
+
+rec <- recipe( ~., data = ft2) %>% 
+  update_role(loja, ano_mes, new_role = 'id') %>% 
+  step_dummy(all_nominal(), -has_role('id'), role = 'dummy') %>%
+  step_interact(~ starts_with("marca"):receita) %>% 
+  prep()
+
+ft3 <- juice(rec)
+
+```
+
+
+## PCA
+
+Para melhor entender a variabilidade dos dados, reduzir a dimensão e avaliar se faz sentido escolher alguma para a clusterizacão hierárquia, é aplicada uma análise de componentes principais.
+
+```{r}
+
+rec_pca <- recipe( ~., data = ft2) %>% 
+  step_normalize(all_numeric()) %>% 
+  step_pca(all_numeric(), - has_role('dummy')) %>% 
+  prep()
+
+ft_pca<- juice(rec_pca) %>% 
+  glimpse
+
+```
+
+A seguir, observa-se que as 5 primeiras componentes explicam mais de 85% da variabilidade dos dados.
+
+```{r}
+
+variance_pct <- rec_pca$steps[[2]]$res
+
+(cumsum(variance_pct$sdev^2) / sum(variance_pct$sdev^2))
+
+fviz_eig(variance_pct, addlabels = TRUE,
+         barfill = '#2d2017', barcolor = '#2d2017', 
+         linecolor = '#4E84C4') +
+  labs(x = "Componente Principal",
+       y = "Percentual explicado da variância") +
+  theme_economist()
+
+
+
+```
+
+```{r}
+tidy_pca <- tidy(rec_pca, 2)
+
+tidy_pca %>%
+  filter(component %in% paste0("PC", 1:6)) %>%
+  group_by(component) %>%
+  top_n(15, abs(value)) %>%
+  ungroup() %>%
+  mutate(terms = reorder_within(terms, abs(value), component)) %>%
+  ggplot(aes(abs(value), terms, fill = if_else(value > 0, 'Positiva','Negativa'))) +
+  geom_col(size = 0.5) +
+  facet_wrap(~component, scales = "free_y") +
+  scale_y_reordered() +
+  scale_fill_manual(values = c('#4E84C4', '#2d2017')) +
+  theme_economist() +
+  labs(x = "Valor absoluto da contribuição",
+       y = NULL, fill = "Contribuição")
+
+```
+
+Pela primeira componente, observa-se que os principais drivers são quantidade, receita e  quantidade de café, assim como a média móvel de dois meses da receita. Importante notar que das 5 primeiras variáveis, 4 foram criadas para a análise.
+
+Com as componentes principais, é possível diminuir a dimensão e criar uma matriz de distâncias para as lojas. Ano e mês aparecem na terceira componente, o que é um indício da característica de série temporal dos dados. 
+
+# Agrupamento
+
+O modelo para agrupamento utilizado será o Kmeans. Como esse modelo não funciona muito bem com variáveis dummy, a base utlizada será composta apenas por variáveis numéricas e normalizada.
+
+
+## Kmeans
+
+```{r}
+
+set.seed(123)
+
+ft_km <- ft2 %>% 
+          select(where(is.numeric)) %>% 
+          scale()
+
+kclusts <- tibble(k = 1:50) %>%
+  mutate(kclust = map(k, ~kmeans(ft_km, .x)),
+        tidied = map(kclust, tidy),
+        glanced = map(kclust, glance),
+        augmented = map(kclust, augment, ft_km)
+        )
+
+clusters <- kclusts %>%
+  unnest(cols = c(tidied))
+
+assignments <- kclusts %>% 
+  unnest(cols = c(augmented))
+
+clusterings <- kclusts %>%
+  unnest(cols = c(glanced))
+
+```
+
+### Definição do número de clusters
+
+Para definição do número de clusters, nota-se pelo gráfico do cotovelo que o número ideal está entre
+15 e 20. Desssa forma, o número 18 será escolhido.
+
+- Cotovelo
+```{r}
+
+clusterings %>% 
+  ggplot(aes(k, tot.withinss)) + 
+  geom_point(size = 3, color = '#2d2017') + 
+  geom_line(color = '#2d2017') + 
+  labs(y = "total within sum of squares", x = "k") +
+  geom_vline(xintercept = 18, color = '#4E84C4') +
+  scale_x_continuous(breaks = 1:50) +
+  theme_economist()
+
+
+set.seed(123)
+kmeans_final <-  kmeans(ft_km, 18)
+
+```
+
+- Confirmação pelo método Sillhouette
+
+```{r}
+
+euc_dist <- parDist(ft_km, method = "euclidean")
+
+kmeans_final <-  kmeans(ft_km, 18)
+
+res_silhouette <- silhouette(kmeans_final$cluster, euc_dist)
+
+
+fviz_silhouette(res_silhouette) +
+  scale_color_tableau("Tableau 20") +
+  scale_fill_tableau("Tableau 20") +
+  theme_economist() +
+  theme(legend.position="right", axis.line.x = element_blank(), 
+                                 axis.text.x = element_blank(),
+                                axis.ticks.x=element_blank())
+
+```
+
+No gráfico silhouette, confirma-se que boa parte dos clusters possu uma largura acima da média. Mesmo assim, algumas das observações poderiam estar melhor realocadas em outro cluster, pois estão com o número negativo.
+
+```{r}
+
+ft <- ft2 %>% 
+      mutate(cluster = as.factor(kmeans_final$cluster))
+
+```
+
+## Clusters
+
+```{r}
+ft %>% 
+  group_by(cluster, marca) %>% 
+  summarize(qtde = sum(qtd_cafe)) %>% 
+  ggplot(aes(area = qtde, fill = cluster, subgroup = cluster, label = marca)) +
+  geom_treemap()+
+  geom_treemap_subgroup_text(place = "left", grow = T, alpha = 0.3, colour =
+                             "black", fontface = "italic", min.size = 0) +
+  geom_treemap_text(colour = "white", place = "topleft", reflow = T) +
+  scale_fill_tableau("Tableau 20") +
+  labs(title = 'Composição dos clusters pelo total da quantidade por marca') +
+  theme_economist() +
+  theme(legend.position="right",  axis.line = element_blank())
+  
+```
+
+Em cada cluster, nota-se diferentes proporções para cada marca. O cluster 2, por exemplo, é dominado pela marca pilão, enquanto o 4 está mais equilibrado. 
+
+```{r}
+
+ft %>% 
+  group_by(cluster, embalagem) %>% 
+  summarize(receita = sum(receita)) %>% 
+  ggplot(aes(area = receita, fill = cluster, subgroup = cluster, label = embalagem)) +
+  geom_treemap()+
+  geom_treemap_subgroup_text(place = "left", grow = T, alpha = 0.3, colour =
+                             "black", fontface = "italic", min.size = 0) +
+  geom_treemap_text(colour = "white", place = "topleft", reflow = T) +
+  scale_fill_tableau("Tableau 20") +
+  labs(title = 'Composição dos clusters pelo total da receita por embalagem') +
+  theme_economist() +
+  theme(legend.position="right", axis.line = element_blank())
+
+```
+
+Assim como no gráfico anterior, percebem-se diferentes porporções de receita por embalagem. 
+
+# Conclusão
+
+Os dados recebidos estavam no formato tidy, exceto pela coluna `descricao`, que foi tratada com regex para extração de marca, tipo de embalagem e intensidade. Foram criadas features de quantidade total de café, preço médio e receita por venda. As características temporais da base poderiam ser exploradas através de um estudo mais detalhado de autocorrelação e sazonalidade, mas optou-se por agregar os dados mensalmente. Para melhor entender a variabilidade dos dados, foi feita uma análise de componentes principais, pela qual constatou-se a importância das features criadas. Para o agrupamento das lojas, foi utilizado o modelo kmeans, cujo k ideal foi 18 clusters. Entre eles, verificou-se a diferença nas proporções por marca e embalagem.
+
+# Referências
+
+- Material de aula da disciplina Práticas Avançadas em Visualizacão de Dados
+- Hadley, W. R for Data Science - Import, Tidy, Transform, Visualize, and Model Data
+- Wilke, C. - Fundamentals of Data Visualization - A Primer on Making Informative and Compelling Figures (2019, O’Reilly Media)
+- https://www.abic.com.br/recomendacoes-tecnicas/categorias-de-qualidade-do-cafe/
+- https://www.pilao.com.br/Nossos-Cafes/Cafe-em-Po
+- https://cafepele.com.br/var/www/html/cafepele.com.br/web/produtos/torrado.html
+- http://www.cafe3coracoes.com.br/nossos-produtos/torrados-e-moidos/
+- https://www.melitta.com.br/cafes/cafes-para-o-dia-a-dia?O=OrderByPriceASC
+- [Lin, Jessica, et. al. Clustering of Time Series Subsequences is Meaningless: Implications for Previous and Future Research](http://www.cs.ucr.edu/~eamonn/meaningless.pdf)
+- Documentação dos pacoes utilizados
